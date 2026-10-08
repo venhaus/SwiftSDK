@@ -19,6 +19,7 @@ protocol SignalManageable {
         configuration: TelemetryManagerConfiguration
     )
     func attemptToSendNextBatchOfCachedSignals()
+    func shutdown()
 
     @MainActor var defaultUserIdentifier: String { get }
 }
@@ -29,6 +30,9 @@ final class SignalManager: SignalManageable, @unchecked Sendable {
 
     private var sendTimerSource: DispatchSourceTimer?
     private let timerQueue = DispatchQueue(label: "com.telemetrydeck.SignalTimer", qos: .utility)
+    private let lifecycleLock = NSRecursiveLock()
+    private var isTerminated = false
+    private var observerWork: DispatchWorkItem?
 
     /// Number of consecutive transmission failures.
     ///
@@ -84,16 +88,16 @@ final class SignalManager: SignalManageable, @unchecked Sendable {
         #elseif os(watchOS)
             if #available(watchOS 7.0, *) {
                 // We need to use a delay with these type of notifications because they fire on app load which causes a double load of the cache from disk
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                scheduleObserverRegistration { manager in
                     NotificationCenter.default.addObserver(
-                        self,
-                        selector: #selector(self.didEnterForeground),
+                        manager,
+                        selector: #selector(manager.didEnterForeground),
                         name: WKExtension.applicationWillEnterForegroundNotification,
                         object: nil
                     )
                     NotificationCenter.default.addObserver(
-                        self,
-                        selector: #selector(self.didEnterBackground),
+                        manager,
+                        selector: #selector(manager.didEnterBackground),
                         name: WKExtension.applicationDidEnterBackgroundNotification,
                         object: nil
                     )
@@ -102,17 +106,17 @@ final class SignalManager: SignalManageable, @unchecked Sendable {
                 // Pre watchOS 7.0, this library will not use disk caching at all as there are no notifications we can observe.
             }
         #elseif os(tvOS) || os(iOS) || os(visionOS)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            scheduleObserverRegistration { manager in
                 // We need to use a delay with these type of notifications because they fire on app load which causes a double load of the cache from disk
                 NotificationCenter.default.addObserver(
-                    self,
-                    selector: #selector(self.didEnterForeground),
+                    manager,
+                    selector: #selector(manager.didEnterForeground),
                     name: UIApplication.willEnterForegroundNotification,
                     object: nil
                 )
                 NotificationCenter.default.addObserver(
-                    self,
-                    selector: #selector(self.didEnterBackground),
+                    manager,
+                    selector: #selector(manager.didEnterBackground),
                     name: UIApplication.didEnterBackgroundNotification,
                     object: nil
                 )
@@ -122,8 +126,42 @@ final class SignalManager: SignalManageable, @unchecked Sendable {
         sendCachedSignalsRepeatedly()
     }
 
+    // Serialize queued cache writes and network handoffs with shutdown.
+    private func beginIfActive() -> Bool {
+        lifecycleLock.lock()
+        guard !isTerminated else {
+            lifecycleLock.unlock()
+            return false
+        }
+        return true
+    }
+
+    private func scheduleObserverRegistration(_ operation: @escaping (SignalManager) -> Void) {
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.beginIfActive() else { return }
+            defer { self.lifecycleLock.unlock() }
+            operation(self)
+        }
+        observerWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+    }
+
+    func shutdown() {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        isTerminated = true
+        observerWork?.cancel()
+        observerWork = nil
+        NotificationCenter.default.removeObserver(self)
+        sendTimerSource?.cancel()
+        sendTimerSource = nil
+        signalCache.clear()
+    }
+
     /// Fires an immediate send attempt and then starts the self-rescheduling timer.
     private func sendCachedSignalsRepeatedly() {
+        guard beginIfActive() else { return }
+        defer { lifecycleLock.unlock() }
         attemptToSendNextBatchOfCachedSignals()
         timerQueue.async {
             self.consecutiveFailures = 0
@@ -135,6 +173,8 @@ final class SignalManager: SignalManageable, @unchecked Sendable {
     ///
     /// Must only be called from `timerQueue`.
     private func scheduleNextTransmission() {
+        guard beginIfActive() else { return }
+        defer { lifecycleLock.unlock() }
         sendTimerSource?.cancel()
 
         let exponent = Double(consecutiveFailures)
@@ -159,10 +199,18 @@ final class SignalManager: SignalManageable, @unchecked Sendable {
     ) {
         // enqueue signal to sending cache
         DispatchQueue.main.async {
+            guard self.beginIfActive() else {
+                return
+            }
+            defer { self.lifecycleLock.unlock() }
             let defaultUserIdentifier = self.defaultUserIdentifier
             let defaultParameters = DefaultSignalPayload.parameters
 
             DispatchQueue.global(qos: .utility).async {
+                guard self.beginIfActive() else {
+                    return
+                }
+                defer { self.lifecycleLock.unlock() }
                 let enrichedMetadata: [String: String] = configuration.metadataEnrichers
                     .map { $0.enrich(signalType: signalName, for: customUserID, floatValue: floatValue) }
                     .reduce([String: String]()) { $0.applying($1) }
@@ -194,6 +242,8 @@ final class SignalManager: SignalManageable, @unchecked Sendable {
     /// If signals fail to send, we put them back into the cache to try again later.
     @Sendable
     func attemptToSendNextBatchOfCachedSignals() {
+        guard beginIfActive() else { return }
+        defer { lifecycleLock.unlock() }
         configuration.logHandler?.log(.debug, message: "Current signal cache count: \(signalCache.count())")
 
         let queuedSignals: [SignalPostBody] = signalCache.pop()
@@ -244,9 +294,12 @@ final class SignalManager: SignalManageable, @unchecked Sendable {
     }
 
     private func handleSendFailure(requeue: [SignalPostBody]) {
+        guard beginIfActive() else { return }
+        defer { lifecycleLock.unlock() }
         signalCache.push(requeue)
         timerQueue.async { [weak self] in
-            guard let self else { return }
+            guard let self, self.beginIfActive() else { return }
+            defer { self.lifecycleLock.unlock() }
             self.sendCompletions += 1
             self.consecutiveFailures += 1
             self.scheduleNextTransmission()
@@ -255,7 +308,8 @@ final class SignalManager: SignalManageable, @unchecked Sendable {
 
     private func handleSendSuccess() {
         timerQueue.async { [weak self] in
-            guard let self else { return }
+            guard let self, self.beginIfActive() else { return }
+            defer { self.lifecycleLock.unlock() }
             self.sendCompletions += 1
             self.consecutiveFailures = 0
             self.scheduleNextTransmission()
@@ -268,6 +322,8 @@ final class SignalManager: SignalManageable, @unchecked Sendable {
 extension SignalManager {
     @MainActor
     @objc fileprivate func appWillTerminate() {
+        guard beginIfActive() else { return }
+        defer { lifecycleLock.unlock() }
         configuration.logHandler?.log(.debug, message: #function)
 
         #if os(watchOS) || os(macOS)
@@ -280,7 +336,10 @@ extension SignalManager {
                 // run backup in background task to avoid blocking main thread while ensuring app stays open during write
                 let backgroundTaskID = UIApplication.shared.beginBackgroundTask()
                 DispatchQueue.global(qos: .background).async {
-                    self.signalCache.backupCache()
+                    if self.beginIfActive() {
+                        self.signalCache.backupCache()
+                        self.lifecycleLock.unlock()
+                    }
 
                     DispatchQueue.main.async {
                         UIApplication.shared.endBackgroundTask(backgroundTaskID)
@@ -292,6 +351,8 @@ extension SignalManager {
 
     #if os(watchOS) || os(tvOS) || os(iOS) || os(visionOS)
         @objc func didEnterForeground() {
+            guard beginIfActive() else { return }
+            defer { lifecycleLock.unlock() }
             configuration.logHandler?.log(.debug, message: #function)
             signalCache.reloadFromDisk()
             sendCachedSignalsRepeatedly()
@@ -299,6 +360,8 @@ extension SignalManager {
 
         @MainActor
         @objc func didEnterBackground() {
+            guard beginIfActive() else { return }
+            defer { lifecycleLock.unlock() }
             configuration.logHandler?.log(.debug, message: #function)
 
             sendTimerSource?.cancel()
@@ -314,7 +377,10 @@ extension SignalManager {
                     // run backup in background task to avoid blocking main thread while ensuring app stays open during write
                     let backgroundTaskID = UIApplication.shared.beginBackgroundTask()
                     DispatchQueue.global(qos: .background).async {
-                        self.signalCache.backupCache()
+                        if self.beginIfActive() {
+                            self.signalCache.backupCache()
+                            self.lifecycleLock.unlock()
+                        }
 
                         DispatchQueue.main.async {
                             UIApplication.shared.endBackgroundTask(backgroundTaskID)
@@ -348,6 +414,10 @@ extension SignalManager {
 
     private func send(_ body: Data, completionHandler: @escaping @Sendable (Data?, URLResponse?, Error?) -> Void) {
         DispatchQueue.global(qos: .utility).async {
+            guard self.beginIfActive() else {
+                return
+            }
+            defer { self.lifecycleLock.unlock() }
             guard let url = SignalManager.getServiceUrl(baseURL: self.configuration.apiBaseURL, namespace: self.configuration.namespace) else {
                 self.configuration.logHandler?.log(
                     .error,

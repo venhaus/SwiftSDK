@@ -236,6 +236,7 @@ public enum TelemetryDeck {
     ///
     /// Once called, you must call `TelemetryManager.initialize(with:)` again before using the manager.
     public static func terminate() {
+        TelemetryManager.initializedTelemetryManager?.shutdown()
         TelemetryManager.initializedTelemetryManager = nil
     }
 

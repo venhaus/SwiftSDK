@@ -314,6 +314,8 @@ struct TelemetryDeckTests {
 }
 
 private class FakeSignalManager: @preconcurrency SignalManageable {
+    func shutdown() {}
+
     var processedSignalTypes: [String] = []
     var processedSignals: [SignalPostBody] = []
 

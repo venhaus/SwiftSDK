@@ -431,6 +431,9 @@ public final class TelemetryManager: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.telemetrydeck.TelemetryManager", attributes: .concurrent)
 
     private var _configuration: TelemetryManagerConfiguration
+    private let lifecycleLock = NSRecursiveLock()
+    private var isTerminated = false
+    private var startupWork: [DispatchWorkItem] = []
     var configuration: TelemetryManagerConfiguration {
         get { queue.sync(flags: .barrier) { _configuration } }
         set { queue.sync(flags: .barrier) { _configuration = newValue } }
@@ -450,38 +453,38 @@ public final class TelemetryManager: @unchecked Sendable {
 
     private func startSessionAndObserveAppForegrounding() {
         // initially start a new session upon app start (delayed so that `didSet` triggers)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            TelemetryDeck.generateNewSession()
+        scheduleStartup { manager in
+            manager.configuration.sessionID = UUID()
         }
 
         // subscribe to notification to start a new session on app entering foreground (if needed)
         #if os(iOS) || os(tvOS)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            scheduleStartup { manager in
                 NotificationCenter.default.addObserver(
-                    self,
-                    selector: #selector(self.willEnterForeground),
+                    manager,
+                    selector: #selector(manager.willEnterForeground),
                     name: UIApplication.willEnterForegroundNotification,
                     object: nil
                 )
                 NotificationCenter.default.addObserver(
-                    self,
-                    selector: #selector(self.didEnterBackground),
+                    manager,
+                    selector: #selector(manager.didEnterBackground),
                     name: UIApplication.didEnterBackgroundNotification,
                     object: nil
                 )
             }
         #elseif os(watchOS)
             if #available(watchOS 7.0, *) {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                scheduleStartup { manager in
                     NotificationCenter.default.addObserver(
-                        self,
-                        selector: #selector(self.willEnterForeground),
+                        manager,
+                        selector: #selector(manager.willEnterForeground),
                         name: WKExtension.applicationWillEnterForegroundNotification,
                         object: nil
                     )
                     NotificationCenter.default.addObserver(
-                        self,
-                        selector: #selector(self.didEnterBackground),
+                        manager,
+                        selector: #selector(manager.didEnterBackground),
                         name: WKExtension.applicationDidEnterBackgroundNotification,
                         object: nil
                     )
@@ -492,15 +495,44 @@ public final class TelemetryManager: @unchecked Sendable {
         #endif
     }
 
+    private func scheduleStartup(_ operation: @escaping (TelemetryManager) -> Void) {
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.lifecycleLock.lock()
+            defer { self.lifecycleLock.unlock() }
+            guard !self.isTerminated, Self.initializedTelemetryManager === self else { return }
+            operation(self)
+        }
+        startupWork.append(work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+    }
+
+    func shutdown() {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        guard !isTerminated else { return }
+        isTerminated = true
+        startupWork.forEach { $0.cancel() }
+        startupWork.removeAll()
+        NotificationCenter.default.removeObserver(self)
+        signalManager.shutdown()
+    }
+
     @objc func willEnterForeground() {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        guard !isTerminated else { return }
         // check if at least 5 minutes have passed since last app entered background
         if self.lastDateAppEnteredBackground.addingTimeInterval(5 * 60) < Date() {
             // generate a new session identifier
-            TelemetryDeck.generateNewSession()
+            configuration.sessionID = UUID()
         }
     }
 
     @objc func didEnterBackground() {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        guard !isTerminated else { return }
         lastDateAppEnteredBackground = Date()
     }
 }

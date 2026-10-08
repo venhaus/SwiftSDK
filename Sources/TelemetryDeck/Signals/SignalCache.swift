@@ -25,6 +25,12 @@ internal class SignalCache<T>: @unchecked Sendable where T: Codable {
         }
     }
 
+    func clear() {
+        queue.sync(flags: .barrier) {
+            cachedSignals.removeAll()
+        }
+    }
+
     /// Insert a Signal into the cache
     func push(_ signal: T) {
         queue.sync(flags: .barrier) {
